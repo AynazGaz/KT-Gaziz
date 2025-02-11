@@ -6,94 +6,122 @@
 PUT /upload/: Загрузка файлов на сервер.
 GET /download/{file_id}: Скачивание файлов с сервера.
 GET /preview/{file_id}: Получение превью с указанными шириной и высотой.
+Открываем страницу http://localhost:8000/docs после запуска сервера
+
+Добавили для бд:
+    Модель MediaFile:
+Хранит информацию о файле: UUID, путь, тип, размер и время загрузки.
+    База данных:
+Используется SQLite для простоты (файл database.db).
+Таблицы создаются автоматически при запуске приложения.
+    Работа с базой данных:
+При загрузке файла информация сохраняется в базу данных.
+При скачивании или получении превью данные берутся из базы данных.
+    Сохранение превью:
+Превью сохраняются в папку previews с именем в формате {file_id}_{width}x{height}.png.
 
 """
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.responses import FileResponse
-from PIL import Image
-import cv2
+from sqlmodel import Session
+from models import MediaFile
+from database import engine, get_db, create_db_and_tables
+from datetime import datetime
 import os
 import uuid
 
 app = FastAPI()
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the File Upload and Download API!"}
+
 # Папки для хранения файлов и превью
 UPLOAD_DIRECTORY = "uploads"
 PREVIEW_DIRECTORY = "previews"
 os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 os.makedirs(PREVIEW_DIRECTORY, exist_ok=True)
 
+# Создание таблиц при запуске приложения
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+
 # Обработчик для корневого пути
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the File Upload and Download API!"}
 
+# Загрузка файла
 @app.put("/upload/")
-async def upload_file(file: UploadFile = File(...)):
-    # Генерируем уникальный ID для файла
+async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
     file_uuid = str(uuid.uuid4())
     file_extension = file.filename.split(".")[-1]
 
-    # Проверяем допустимые форматы файлов
     if file_extension not in ["png", "jpg", "jpeg", "mp4", "avi"]:
         raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    # Сохраняем файл на сервере
     file_path = os.path.join(UPLOAD_DIRECTORY, f"{file_uuid}.{file_extension}")
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
 
+    file_size = os.path.getsize(file_path)
+    file_type = "IMG" if file_extension in ["png", "jpg", "jpeg"] else "VID"
+
+    # Сохранение информации о файле в базу данных
+    media_file = MediaFile(
+        id=file_uuid,
+        file_path=file_path,
+        file_type=file_type,
+        file_size=file_size,
+        created_at=datetime.utcnow()
+    )
+    db.add(media_file)
+    db.commit()
+    db.refresh(media_file)
+
     return {"message": "File uploaded successfully", "file_id": file_uuid}
 
+# Скачивание файла
 @app.get("/download/{file_id}")
-async def download_file(file_id: str):
-    # Ищем файл по ID
-    for file_name in os.listdir(UPLOAD_DIRECTORY):
-        if file_name.startswith(file_id):
-            file_path = os.path.join(UPLOAD_DIRECTORY, file_name)
-            return FileResponse(file_path)
+async def download_file(file_id: str, db: Session = Depends(get_db)):
+    media_file = db.get(MediaFile, file_id)
+    if not media_file:
+        raise HTTPException(status_code=404, detail="File not found")
 
-    # Если файл не найден
-    raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(media_file.file_path)
 
+# Получение превью
 @app.get("/preview/{file_id}")
-async def get_preview(file_id: str, width: int, height: int):
-    # Ищем файл по ID
-    for file_name in os.listdir(UPLOAD_DIRECTORY):
-        if file_name.startswith(file_id):
-            file_path = os.path.join(UPLOAD_DIRECTORY, file_name)
-            file_extension = file_name.split(".")[-1]
+async def get_preview(file_id: str, width: int, height: int, db: Session = Depends(get_db)):
+    media_file = db.get(MediaFile, file_id)
+    if not media_file:
+        raise HTTPException(status_code=404, detail="File not found")
 
-            # Путь для сохранения превью
-            preview_path = os.path.join(PREVIEW_DIRECTORY, f"{file_id}_{width}x{height}.png")
+    file_path = media_file.file_path
+    file_extension = file_path.split(".")[-1]
 
-            # Если превью уже существует, возвращаем его
-            if os.path.exists(preview_path):
-                return FileResponse(preview_path)
+    preview_path = os.path.join(PREVIEW_DIRECTORY, f"{file_id}_{width}x{height}.png")
 
-            # Обработка изображений
-            if file_extension in ["png", "jpg", "jpeg"]:
-                with Image.open(file_path) as img:
-                    img = img.resize((width, height))
-                    img.save(preview_path, format="PNG")
-                    return FileResponse(preview_path)
+    if os.path.exists(preview_path):
+        return FileResponse(preview_path)
 
-            # Обработка видео
-            elif file_extension in ["mp4", "avi"]:
-                cap = cv2.VideoCapture(file_path)
-                success, frame = cap.read()
-                cap.release()
-                if not success:
-                    raise HTTPException(status_code=500, detail="Failed to capture video frame")
+    if file_extension in ["png", "jpg", "jpeg"]:
+        from PIL import Image
+        with Image.open(file_path) as img:
+            img = img.resize((width, height))
+            img.save(preview_path, format="PNG")
+            return FileResponse(preview_path)
 
-                frame = cv2.resize(frame, (width, height))
-                cv2.imwrite(preview_path, frame)
-                return FileResponse(preview_path)
+    elif file_extension in ["mp4", "avi"]:
+        import cv2
+        cap = cv2.VideoCapture(file_path)
+        success, frame = cap.read()
+        cap.release()
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to capture video frame")
 
-    # Если файл не найден
-    raise HTTPException(status_code=404, detail="File not found")
+        frame = cv2.resize(frame, (width, height))
+        cv2.imwrite(preview_path, frame)
+        return FileResponse(preview_path)
+
+    raise HTTPException(status_code=400, detail="Unsupported file type")
 
 if __name__ == "__main__":
     import uvicorn
